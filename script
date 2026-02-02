@@ -543,125 +543,149 @@ local function createMockTrade(realPlayer)
 end
 
 local function createTradeHistoryRecord(trade)
-   local record = {
-       trade_id = trade.trade_id,
-       timestamp = os.time(),
-       sender_user_id = Players.LocalPlayer.UserId,
-       sender_name = Players.LocalPlayer.Name,
-       sender_items = TableUtil.deep_copy(trade.sender_offer.items),
-       recipient_user_id = trade.recipient.UserId,
-       recipient_name = CONFIG.PARTNER_NAME,
-       recipient_items = TableUtil.deep_copy(trade.recipient_offer.items),
-       reported = false,
-       reverted = nil,
-   }
-   return record
+	local record = {
+		trade_id = trade.trade_id,
+		timestamp = os.time(),
+		sender_user_id = Players.LocalPlayer.UserId,
+		sender_name = Players.LocalPlayer.Name,
+		sender_items = TableUtil.deep_copy(trade.sender_offer.items),
+		recipient_user_id = trade.recipient.UserId,
+		recipient_name = CONFIG.PARTNER_NAME,
+		recipient_items = TableUtil.deep_copy(trade.recipient_offer.items),
+		reported = false,
+		reverted = nil,
+	}
+	return record
 end
 
 local function appendToTradeHistory(tradeRecord)
-   if mockState.addedTradeIds[tradeRecord.trade_id] then
-       return
-   end
+	if mockState.addedTradeIds[tradeRecord.trade_id] then
+		return
+	end
 
-   mockState.addedTradeIds[tradeRecord.trade_id] = true
-   table.insert(mockState.tradeHistory, tradeRecord)
+	mockState.addedTradeIds[tradeRecord.trade_id] = true
+	table.insert(mockState.tradeHistory, tradeRecord)
 end
 
 local function hookTradeHistoryFunctions()
-   if not TradeHistoryApp then
-       return
-   end
+	if not TradeHistoryApp then
+		return
+	end
 
-   TradeHistoryApp._get_trade_history = function(self, useCache)
-       local history = mockState.originalGetTradeHistory(self, useCache)
+	TradeHistoryApp._get_trade_history = function(self, useCache)
+		local history = mockState.originalGetTradeHistory(self, useCache)
 
-       local combined = {}
-       local seenIds = {}
+		-- Combine + dedupe by trade_id
+		local combined = {}
+		local seenIds = {}
 
-       if history then
-           for _, realTrade in ipairs(history) do
-               if not seenIds[realTrade.trade_id] then
-                   table.insert(combined, realTrade)
-                   seenIds[realTrade.trade_id] = true
-               end
-           end
-       end
+		local function push(record)
+			if not record then return end
+			local id = tostring(record.trade_id or "")
+			if id == "" then return end
+			if seenIds[id] then return end
+			seenIds[id] = true
+			table.insert(combined, record)
+		end
 
-       for _, mockTrade in ipairs(mockState.tradeHistory) do
-           if not seenIds[mockTrade.trade_id] then
-               table.insert(combined, mockTrade)
-               seenIds[mockTrade.trade_id] = true
-           end
-       end
+		if history then
+			for _, realTrade in ipairs(history) do
+				push(realTrade)
+			end
+		end
 
-       self.cached_trade_history = combined
-       return combined
-   end
+		for _, mockTrade in ipairs(mockState.tradeHistory) do
+			push(mockTrade)
+		end
 
-      -- UPDATED: Enhanced report_scam hook with hint and proper dialog flow
-    TradeHistoryApp.report_scam = function(self, tradeData)
-        if tradeData and string.find(tostring(tradeData.trade_id), 'MOCK_') then
-            -- Hide the trade history app temporarily
-            self.UIManager.set_app_visibility(self.ClassName, false)
+		-- Sort chronologically (most recent first)
+		-- NOTE: your mock trades use `timestamp = os.time()`.
+		-- Real trade records usually have `timestamp` too, but we fall back safely.
+		local function getTs(t)
+			if not t then return 0 end
+			-- Debug: print trade record structure for first few trades
+			if t.trade_id and string.find(tostring(t.trade_id), 'MOCK_') then
+			-- This is a mock trade, we know it has timestamp
+			return t.timestamp or 0
+			else
+			-- This is a real trade, check all possible time fields
+			local ts = t.timestamp or t.time or t.created_at or t.date or t.updated_at or t.completed_at
+			ts = tonumber(ts) or 0
+			-- If still 0, try to extract from any field that looks like a time
+			if ts == 0 then
+				for k, v in pairs(t) do
+					if type(k) == 'string' and (string.find(k:lower(), 'time') or string.find(k:lower(), 'date') or string.find(k:lower(), 'created') or string.find(k:lower(), 'updated')) then
+						local num = tonumber(v)
+						if num and num > 1000000000 then -- Reasonable timestamp check
+							ts = num
+							break
+						end
+					end
+				end
+			end
+			return ts
+		end
+		end
 
-            -- Show the REAL report dialog with full options
-            local dialogResult, reasonText, otherText = 
-                self.UIManager.apps.DialogApp:dialog({
-                    dialog_type = 'ReportScamDialog',
-                    suspect_name = CONFIG.PARTNER_NAME,
-                    placeholder_text = 'What happened? (Optional)',
-                    max_length = 500,
-                    use_utf8_length = true,
-                    left = 'Cancel',
-                    right = 'Report'
-                })
-            
-            if dialogResult == 'Report' then
-                -- Show "Submitting report..." hint
-                if self.UIManager.apps.HintApp then
-                    self.UIManager.apps.HintApp:hint({
-                        text = 'Submitting scam report...',
-                        length = 4,
-                        yields = false,
-                    })
-                end
-                
-                -- Simulate delay for submission
-                task.wait(2)
-                
-                -- Mark as reported
-                for _, record in ipairs(mockState.tradeHistory) do
-                    if record.trade_id == tradeData.trade_id then
-                        record.reported = true
-                        break
-                    end
-                end
-                
-                -- Show success message
-                self.UIManager.apps.DialogApp:dialog({
-                    text = 'Thanks for your report!',
-                    button = 'Close',
-                    yields = false,
-                })
-                
-                -- Auto-refresh the trade history
-                task.spawn(function()
-                    task.wait(0.5)
-                    if self._refresh then
-                        pcall(function() self:_refresh() end)
-                    end
-                end)
-                
-                return true
-            end
-            
-            -- Re-show trade history app if canceled
-            self.UIManager.set_app_visibility(self.ClassName, true)
-            return false
-        end
-        return mockState.originalReportScam(self, tradeData)
-    end
+		table.sort(combined, function(a, b)
+			local ta, tb = getTs(a), getTs(b)
+			if ta == tb then
+				-- deterministic tie-breaker so ordering doesn't flicker
+				return tostring(a.trade_id) > tostring(b.trade_id)
+			end
+			return ta < tb  -- Sort oldest first (ascending order)
+		end)
+
+		self.cached_trade_history = combined
+		return combined
+	end
+
+
+	TradeHistoryApp.report_scam = function(self, tradeData)
+		if tradeData and string.find(tostring(tradeData.trade_id), 'MOCK_') then
+			self.UIManager.set_app_visibility(self.ClassName, false)
+
+			local response1, response2, response3 =
+				self.UIManager.apps.DialogApp:dialog({
+					dialog_type = 'ReportScamDialog',
+					suspect_name = CONFIG.PARTNER_NAME,
+					placeholder_text = 'What happened? (Optional)',
+					max_length = 500,
+					use_utf8_length = true,
+					left = 'Cancel',
+					right = 'Report',
+				})
+
+			self.UIManager.set_app_visibility(self.ClassName, true)
+
+			if response1 == 'Report' then
+				for _, record in ipairs(mockState.tradeHistory) do
+					if record.trade_id == tradeData.trade_id then
+						record.reported = true
+						break
+					end
+				end
+
+				self.UIManager.apps.DialogApp:dialog({
+					text = 'Report submitted for review.',
+					button = 'Close',
+					yields = false,
+				})
+			end
+
+			if self.instance.Frame.Visible then
+				self:_refresh()
+			else
+				self:_clear_scrolling_frame()
+			end
+
+			return
+		end
+
+		return mockState.originalReportScam(self, tradeData)
+	end
 end
+
 
 hookTradeHistoryFunctions()
 
